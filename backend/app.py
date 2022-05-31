@@ -18,6 +18,9 @@ from flask_cors import CORS, cross_origin
 
 from flax.jax_utils import replicate
 from flax.training.common_utils import shard_prng_key
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 
 # type used for computation - use bfloat16 on TPU's
 dtype = jnp.bfloat16 if jax.local_device_count() == 8 else jnp.float32
@@ -131,7 +134,8 @@ def generate_images_api():
         buffered = BytesIO()
         img.save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        generated_images.append(img_str)
+        result = cloudinary.uploader.upload("data:image/jpeg;base64,"+img_str)
+        generated_images.append(result["url"])
 
     print(f'Created {num_images} images from text prompt [{text_prompt}]')
     return jsonify(generated_images)
