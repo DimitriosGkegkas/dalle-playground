@@ -21,6 +21,13 @@ from flax.training.common_utils import shard_prng_key
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
+import os
+
+cloudinary.config( 
+  cloud_name = os.environ['CLOUD_NAME'], 
+  api_key = os.environ['API_KEY'], 
+  api_secret = os.environ['API_SECRET']
+)
 
 # type used for computation - use bfloat16 on TPU's
 dtype = jnp.bfloat16 if jax.local_device_count() == 8 else jnp.float32
