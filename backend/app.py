@@ -1,17 +1,9 @@
+import argparse
 import base64
-import random
-import sys
+import os
+from pathlib import Path
 from io import BytesIO
-import random
-from functools import partial
-
-import jax
-import numpy as np
-import jax.numpy as jnp
-from PIL import Image
-
-from dalle_mini import DalleBart, DalleBartProcessor
-from vqgan_jax.modeling_flax_vqgan import VQModel
+import time
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
@@ -37,126 +29,67 @@ dtype = jnp.float32
 
 import wandb
 
+from consts import DEFAULT_IMG_OUTPUT_DIR
+from utils import parse_arg_boolean, parse_arg_dalle_version
+from consts import ModelSize
 
 app = Flask(__name__)
 CORS(app)
-print('--> Starting DALL-E Server. This might take up to two minutes.')
+print("--> Starting DALL-E Server. This might take up to two minutes.")
 
-# dalle-mini
-DALLE_MODEL = "dalle-mini/dalle-mini/wzoooa1c:latest"  # can be wandb artifact or 🤗 Hub or local folder or google bucket
-# DALLE_MODEL = 'dalle-mini/dalle-mini/mega-1:latest' # uncomment this line to use DALL-E Mega. Warning: requires significantly more storage and GPU RAM
-DALLE_COMMIT_ID = None
+from dalle_model import DalleModel
+dalle_model = None
 
-# VQGAN model
-VQGAN_REPO = "dalle-mini/vqgan_imagenet_f16_16384"
-VQGAN_COMMIT_ID = "e93a26e7707683d349bf5d5c41c5b0ef69b677a9"
+parser = argparse.ArgumentParser(description = "A DALL-E app to turn your textual prompts into visionary delights")
+parser.add_argument("--port", type=int, default=8000, help = "backend port")
+parser.add_argument("--model_version", type = parse_arg_dalle_version, default = ModelSize.MINI, help = "Mini, Mega, or Mega_full")
+parser.add_argument("--save_to_disk", type = parse_arg_boolean, default = False, help = "Should save generated images to disk")
+parser.add_argument("--img_format", type = str.lower, default = "JPEG", help = "Generated images format", choices=['jpeg', 'png'])
+parser.add_argument("--output_dir", type = str, default = DEFAULT_IMG_OUTPUT_DIR, help = "Customer directory for generated images")
+args = parser.parse_args()
 
-
-# We can customize top_k/top_p used for generating samples
-gen_top_k = None
-gen_top_p = 0.9
-temperature = None
-cond_scale = 3.0
-
-wandb.init(anonymous="must")
-
-
-# Load models & tokenizer
-model = DalleBart.from_pretrained(DALLE_MODEL, revision=DALLE_COMMIT_ID)
-vqgan = VQModel.from_pretrained(VQGAN_REPO, revision=VQGAN_COMMIT_ID)
-
-# convert model parameters for inference if requested
-if dtype == jnp.bfloat16:
-    model.params = model.to_bf16(model.params)
-
-model._params = replicate(model.params)
-vqgan._params = replicate(vqgan.params)
-
-processor = DalleBartProcessor.from_pretrained(DALLE_MODEL, revision=DALLE_COMMIT_ID)
-
-
-# model inference
-@partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(3, 4, 5, 6))
-def p_generate(tokenized_prompt, key, params, top_k, top_p, temperature, condition_scale):
-    return model.generate(
-        **tokenized_prompt,
-        prng_key=key,
-        params=params,
-        top_k=top_k,
-        top_p=top_p,
-        temperature=temperature,
-        condition_scale=condition_scale,
-    )
-
-
-# decode images
-@partial(jax.pmap, axis_name="batch")
-def p_decode(indices, params):
-    return vqgan.decode_code(indices, params=params)
-
-  
-def tokenize_prompt(prompt: str):
-  tokenized_prompt = processor([prompt])
-  return replicate(tokenized_prompt)
-
-def generate_images(prompt:str, num_predictions: int):
-  tokenized_prompt = tokenize_prompt(prompt)
-  
-  # create a random key
-  seed = random.randint(0, 2**32 - 1)
-  key = jax.random.PRNGKey(seed)
-
-  # generate images
-  images = []
-  for i in range(num_predictions // jax.device_count()):
-      # get a new key
-      key, subkey = jax.random.split(key)
-      
-      # generate images
-      encoded_images = p_generate(tokenized_prompt, shard_prng_key(subkey),
-          model.params,gen_top_k, gen_top_p, temperature, cond_scale,
-      )
-      
-      # remove BOS
-      encoded_images = encoded_images.sequences[..., 1:]
-
-      # decode images
-      decoded_images = p_decode(encoded_images, vqgan.params)
-      decoded_images = decoded_images.clip(0.0, 1.0).reshape((-1, 256, 256, 3))
-      for img in decoded_images:
-          images.append(Image.fromarray(np.asarray(img * 255, dtype=np.uint8)))
-        
-  return images
-
-@app.route('/dalle', methods=['POST'])
+@app.route("/dalle", methods=["POST"])
 @cross_origin()
 def generate_images_api():
     json_data = request.get_json(force=True)
     text_prompt = json_data["text"]
     num_images = json_data["num_images"]
-    generated_imgs = generate_images(text_prompt, num_images)
+    generated_imgs = dalle_model.generate_images(text_prompt, num_images)
 
-    generated_images = []
-    for img in generated_imgs:
+    returned_generated_images = []
+    if args.save_to_disk: 
+        dir_name = os.path.join(args.output_dir,f"{time.strftime('%Y-%m-%d_%H:%M:%S')}_{text_prompt}")
+        Path(dir_name).mkdir(parents=True, exist_ok=True)
+    
+    for idx, img in enumerate(generated_imgs):
+        if args.save_to_disk: 
+          img.save(os.path.join(dir_name, f'{idx}.{args.img_format}'), format=args.img_format)
+
         buffered = BytesIO()
-        img.save(buffered, format="JPEG")
+        img.save(buffered, format=args.img_format)
         img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
         result = cloudinary.uploader.upload("data:image/jpeg;base64,"+img_str)
         generated_images.append(result["url"])
 
-    print(f'Created {num_images} images from text prompt [{text_prompt}]')
-    return jsonify(generated_images)
+    print(f"Created {num_images} images from text prompt [{text_prompt}]")
+    
+    response = {'generatedImgs': returned_generated_images,
+    'generatedImgsFormat': args.img_format}
+    return jsonify(response)
 
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 @cross_origin()
 def health_check():
     return jsonify(success=True)
 
+
 with app.app_context():
-    generate_images("warm-up", 1)
-    print('--> DALL-E Server is up and running!')
+    dalle_model = DalleModel(args.model_version)
+    dalle_model.generate_images("warm-up", 1)
+    print("--> DALL-E Server is up and running!")
+    print(f"--> Model selected - DALL-E {args.model_version}")
 
 
-if __name__ == '__main__':    
-    app.run(host="0.0.0.0", port=int(sys.argv[1]), debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=args.port, debug=False)
